@@ -13,10 +13,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import javax.imageio.ImageIO;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.sql.*;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -41,6 +42,11 @@ public class SimpleBrowser extends JFrame {
     private JTextArea txtStatsAndHeaders;
     private JTextArea txtRawHtml;
     private JEditorPane htmlRenderPane;
+    private final CardLayout previewLayout = new CardLayout();
+    private final JPanel previewCards = new JPanel(previewLayout);
+    private final PdfPreview pdfPreview = new PdfPreview();
+    private final JLabel imagePreview = new JLabel("", SwingConstants.CENTER);
+    private JTabbedPane tabbedPane;
 
     private String lastRawHtml = "";
     private String lastUrl = "";
@@ -86,7 +92,7 @@ public class SimpleBrowser extends JFrame {
     }
 
     public SimpleBrowser() {
-        setTitle("VKU Simple Web Browser (Hỗ trợ GET / HEAD / POST / Download & Database Lịch sử)");
+        setTitle("VKU Simple Web Browser (Hỗ trợ GET / HEAD / POST / Download & Lịch sử cục bộ)");
         setSize(1120, 780);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLocationRelativeTo(null);
@@ -119,8 +125,8 @@ public class SimpleBrowser extends JFrame {
 
         btnScan = new JButton("Quét LAN");
         btnHistory = new JButton("Lịch sử");
-        btnDbManager = new JButton("🗄️ CSDL");
-        btnOpenExternal = new JButton("Mở Chrome");
+        btnDbManager = new JButton("Lịch sử trên máy này");
+        btnOpenExternal = new JButton("Mở ứng dụng mặc định");
         btnOpenExternal.setEnabled(false);
 
         btnPanel.add(btnSend);
@@ -159,7 +165,7 @@ public class SimpleBrowser extends JFrame {
         scrollStats.setBorder(BorderFactory.createTitledBorder("Kết quả phân tích HTTP & Thống kê thẻ HTML"));
 
         // 3. Tabbed Pane
-        JTabbedPane tabbedPane = new JTabbedPane();
+        tabbedPane = new JTabbedPane();
         htmlRenderPane = new JEditorPane();
         htmlRenderPane.setEditable(false);
         htmlRenderPane.setContentType("text/html");
@@ -179,7 +185,10 @@ public class SimpleBrowser extends JFrame {
             }
         });
 
-        tabbedPane.addTab("🌐 Giao diện hiển thị HTML & CSS (Web View)", new JScrollPane(htmlRenderPane));
+        previewCards.add(new JScrollPane(htmlRenderPane), "html");
+        previewCards.add(pdfPreview, "pdf");
+        previewCards.add(new JScrollPane(imagePreview), "image");
+        tabbedPane.addTab("Nội dung trang web / file", previewCards);
 
         txtRawHtml = new JTextArea();
         txtRawHtml.setEditable(false);
@@ -207,7 +216,6 @@ public class SimpleBrowser extends JFrame {
         btnScan.addActionListener(e -> autoScanLanServer(false));
 
         updateNavButtons();
-        autoScanLanServer(true);
     }
 
     private void setupHtmlRenderKit() {
@@ -229,10 +237,18 @@ public class SimpleBrowser extends JFrame {
     }
 
     private void executeRequest(boolean addToHistory) {
-        String rawUrl = txtUrl.getText().trim();
-        if (!rawUrl.startsWith("http://") && !rawUrl.startsWith("https://")) {
-            rawUrl = "http://" + rawUrl;
-            txtUrl.setText(rawUrl);
+        URI address;
+        try {
+            address = BrowserAddress.resolve(txtUrl.getText());
+        } catch (IllegalArgumentException e) {
+            txtStatsAndHeaders.setText("Địa chỉ chưa hợp lệ: " + e.getMessage());
+            return;
+        }
+        String rawUrl = address.toASCIIString();
+        txtUrl.setText(rawUrl);
+        if ("file".equalsIgnoreCase(address.getScheme())) {
+            openLocalFile(address, addToHistory);
+            return;
         }
 
         String method = (String) cbMethod.getSelectedItem();
@@ -265,6 +281,10 @@ public class SimpleBrowser extends JFrame {
                 HttpResponse<byte[]> response = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofByteArray());
                 int statusCode = response.statusCode();
                 HttpHeaders headers = response.headers();
+                String saved = headers.firstValue("X-Database-Saved").orElse("");
+                String databaseInfo = "true".equals(saved)
+                        ? "PostgreSQL trên Server: ĐÃ LƯU bản ghi #" + headers.firstValue("X-Database-Record-Id").orElse("?") + "\n"
+                        : "false".equals(saved) ? "PostgreSQL trên Server: CHƯA LƯU — kiểm tra Server.\n" : "";
                 String contentType = headers.firstValue("content-type").orElse("text/plain");
                 lastContentType = contentType;
                 lastUrl = response.uri().toString();
@@ -282,7 +302,7 @@ public class SimpleBrowser extends JFrame {
 
                     SwingUtilities.invokeLater(() -> {
                         if (addToHistory) recordVisit(method, targetUrl, postData, statusCode, 0);
-                        txtStatsAndHeaders.setText(headInfo.toString());
+                        txtStatsAndHeaders.setText(databaseInfo + headInfo);
                         txtRawHtml.setText("(Phương thức HEAD không trả về thân dữ liệu)");
                         renderHtmlSafely("<html><body><div class='card'><h2>Kết quả phương thức HEAD (HTTP " + statusCode + ")</h2>"
                                 + "<p>Phương thức <span>HEAD</span> chỉ lấy các Headers của máy chủ mà không tải nội dung file.</p></div></body></html>");
@@ -321,9 +341,13 @@ public class SimpleBrowser extends JFrame {
 
                         SwingUtilities.invokeLater(() -> {
                             if (addToHistory) recordVisit(method, targetUrl, postData, statusCode, byteLength);
-                            txtStatsAndHeaders.setText(stats.toString());
+                            txtStatsAndHeaders.setText(databaseInfo + stats);
                             txtRawHtml.setText("[Dữ liệu nhị phân - Kích thước: " + byteLength + " bytes]");
-                            renderHtmlSafely(previewHtml);
+                            if (contentType.contains("pdf")) {
+                                showPdf(bodyBytes);
+                            } else {
+                                renderHtmlSafely(previewHtml);
+                            }
                             btnSend.setEnabled(true);
                             btnDownload.setEnabled(true);
                             btnOpenExternal.setEnabled(true);
@@ -352,7 +376,7 @@ public class SimpleBrowser extends JFrame {
 
                         SwingUtilities.invokeLater(() -> {
                             if (addToHistory) recordVisit(method, targetUrl, postData, statusCode, byteLength);
-                            txtStatsAndHeaders.setText(stats.toString());
+                            txtStatsAndHeaders.setText(databaseInfo + stats);
                             txtRawHtml.setText(htmlContent);
                             txtRawHtml.setCaretPosition(0);
                             renderHtmlSafely(printableHtml);
@@ -371,6 +395,100 @@ public class SimpleBrowser extends JFrame {
                 });
             }
         }).start();
+    }
+
+    private void showPdf(byte[] bytes) {
+        previewLayout.show(previewCards, "pdf");
+        tabbedPane.setSelectedIndex(0);
+        pdfPreview.showPdf(bytes);
+    }
+
+    private static String escapeHtml(String value) {
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    private void openLocalFile(URI uri, boolean addToHistory) {
+        btnSend.setEnabled(false);
+        btnDownload.setEnabled(false);
+        btnOpenExternal.setEnabled(false);
+        cbMethod.setSelectedItem("GET");
+        lastResponseBody = null;
+        txtStatsAndHeaders.setText("Đang đọc file trên máy này: " + uri);
+        new Thread(() -> {
+            try {
+                Path path = Path.of(uri);
+                if (!Files.exists(path)) throw new FileNotFoundException(path.toString());
+                if (Files.isDirectory(path)) {
+                    StringBuilder listing = new StringBuilder("<html><body><h2>" + escapeHtml(path.toString()) + "</h2>");
+                    if (path.getParent() != null) listing.append("<p><a href=\"").append(path.getParent().toUri()).append("\">Thư mục cha</a></p>");
+                    try (var children = Files.list(path)) {
+                        children.sorted().limit(1000).forEach(child -> listing.append("<p><a href=\"")
+                                .append(child.toUri().toASCIIString()).append("\">")
+                                .append(escapeHtml(child.getFileName().toString())).append("</a></p>"));
+                    }
+                    listing.append("</body></html>");
+                    SwingUtilities.invokeLater(() -> {
+                        lastUrl = uri.toASCIIString();
+                        lastContentType = "text/html";
+                        renderHtmlSafely(listing.toString());
+                        tabbedPane.setSelectedIndex(0);
+                        txtRawHtml.setText("");
+                        txtStatsAndHeaders.setText("Thư mục trên máy này: " + path + "\nBấm tên file để mở (tối đa 1000 mục).");
+                        btnSend.setEnabled(true);
+                        btnOpenExternal.setEnabled(true);
+                        if (addToHistory) recordVisit("GET", lastUrl, "", 200, 0);
+                    });
+                    return;
+                }
+                long size = Files.size(path);
+                String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+                boolean pdf = name.endsWith(".pdf");
+                boolean image = name.matches(".*\\.(png|jpe?g|gif|bmp|wbmp)");
+                boolean html = name.matches(".*\\.(html?|xhtml)");
+                boolean text = html || name.matches(".*\\.(txt|csv|log|json|xml|md|java|css|js|sql|properties|ya?ml|ini)");
+                boolean previewable = (pdf || image || text) && size <= 64L * 1024 * 1024;
+                byte[] bytes = previewable ? Files.readAllBytes(path) : null;
+                java.awt.image.BufferedImage picture = previewable && image ? ImageIO.read(new ByteArrayInputStream(bytes)) : null;
+                String contents = previewable && text ? new String(bytes, StandardCharsets.UTF_8) : "";
+                String mime = Files.probeContentType(path);
+                String contentType = mime == null ? "application/octet-stream" : mime;
+                SwingUtilities.invokeLater(() -> {
+                    lastUrl = uri.toASCIIString();
+                    lastContentType = contentType;
+                    lastResponseBody = bytes;
+                    pdfPreview.clear();
+                    imagePreview.setIcon(null);
+                    txtRawHtml.setText(text ? contents : "File nhị phân: " + path.getFileName());
+                    if (previewable && pdf) {
+                        showPdf(bytes);
+                    } else if (picture != null) {
+                        imagePreview.setIcon(new ImageIcon(picture));
+                        previewLayout.show(previewCards, "image");
+                    } else if (previewable && text) {
+                        renderHtmlSafely(html ? prepareHtmlForSwingView(contents, lastUrl)
+                                : "<html><body><pre>" + escapeHtml(contents) + "</pre></body></html>");
+                    } else {
+                        renderHtmlSafely("<html><body><h2>" + escapeHtml(path.getFileName().toString()) + "</h2><p>"
+                                + size + " bytes</p><p>" + (size > 64L * 1024 * 1024 ? "File lớn hơn giới hạn xem trước 64 MB."
+                                : "Định dạng này chưa hỗ trợ xem trực tiếp trong Browser.")
+                                + "</p><p>Bấm <b>Mở ứng dụng mặc định</b> để xem file.</p></body></html>");
+                    }
+                    tabbedPane.setSelectedIndex(0);
+                    txtStatsAndHeaders.setText("FILE TRÊN MÁY NÀY\nĐường dẫn: " + path + "\nKích thước: " + size
+                            + " bytes\nKhông gửi file lên HTTP Server hoặc PostgreSQL.");
+                    btnSend.setEnabled(true);
+                    btnOpenExternal.setEnabled(true);
+                    btnDownload.setEnabled(bytes != null);
+                    if (addToHistory) recordVisit("GET", lastUrl, "", 200, size);
+                });
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() -> {
+                    renderHtmlSafely("<html><body><h2>Không mở được đường dẫn</h2><p>" + escapeHtml(e.getMessage() == null ? e.toString() : e.getMessage()) + "</p></body></html>");
+                    txtStatsAndHeaders.setText("Không mở được file trên máy này: " + e.getMessage());
+                    btnSend.setEnabled(true);
+                });
+            }
+        }, "local-file-reader").start();
     }
 
     private void performDownloadFile() {
@@ -410,9 +528,13 @@ public class SimpleBrowser extends JFrame {
     }
 
     private void renderHtmlSafely(String cleanHtml) {
+        pdfPreview.clear();
+        imagePreview.setIcon(null);
+        previewLayout.show(previewCards, "html");
         try {
             HTMLEditorKit kit = (HTMLEditorKit) htmlRenderPane.getEditorKit();
             HTMLDocument doc = (HTMLDocument) kit.createDefaultDocument();
+            if (!lastUrl.isEmpty()) doc.setBase(URI.create(lastUrl).toURL());
             doc.putProperty("IgnoreCharsetDirective", Boolean.TRUE);
             htmlRenderPane.setDocument(doc);
             htmlRenderPane.setText(cleanHtml);
@@ -423,9 +545,123 @@ public class SimpleBrowser extends JFrame {
     }
 
     private String prepareHtmlForSwingView(String rawHtml, String baseUrl) {
-        String clean = rawHtml.replaceAll("(?is)<(script|style|svg)[^>]*>.*?</\\1>", "");
-        clean = clean.replaceAll("(?is)<(link|meta)[^>]*>", "");
+        if (rawHtml == null || rawHtml.isEmpty()) return "";
+
+        // 1. Loại bỏ <script> không cần thiết
+        String clean = rawHtml.replaceAll("(?is)<script[^>]*>.*?</script>", "");
+
+        // 2. Chuyển đổi toàn bộ relative URL (href, src) thành absolute URL dựa theo baseUrl
+        clean = resolveRelativeUrls(clean, baseUrl);
+
+        // 3. Xử lý ảnh SVG / biểu tượng không hỗ trợ trên Swing để tránh bị hiện ô vuông dấu X đỏ
+        clean = clean.replaceAll("(?is)<svg[^>]*>.*?</svg>", "");
+        clean = clean.replaceAll("(?is)<img[^>]+src=[\"'][^\"']*?\\.svg[\"'][^>]*>", "");
+
+        // 4. Tự động nạp và nhúng các stylesheet CSS được liên kết bằng <link rel="stylesheet">
+        clean = inlineStylesheets(clean, baseUrl);
+
+        // 5. Bổ sung bộ CSS hiện đại chuẩn hóa cho Swing
+        String injectedCss = "<style type='text/css'>\n"
+                + "body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-size: 13px; color: #24292f; background-color: #ffffff; margin: 15px; line-height: 1.5; }\n"
+                + "h1 { font-size: 20px; color: #0969da; border-bottom: 2px solid #eaeef2; padding-bottom: 6px; margin: 15px 0 10px 0; }\n"
+                + "h2 { font-size: 16px; color: #1f2328; border-bottom: 1px solid #d0d7de; padding-bottom: 4px; margin: 12px 0 8px 0; }\n"
+                + "h3 { font-size: 14px; color: #24292f; margin: 10px 0 6px 0; }\n"
+                + "p { margin: 6px 0; line-height: 1.5; }\n"
+                + "a { color: #0969da; text-decoration: none; font-weight: 500; }\n"
+                + "a:hover { text-decoration: underline; color: #0550ae; }\n"
+                + "ul, ol { margin-left: 20px; padding-left: 5px; margin-top: 4px; margin-bottom: 8px; }\n"
+                + "li { margin-bottom: 5px; }\n"
+                + "table { border-collapse: collapse; width: 100%; margin: 12px 0; border: 1px solid #d0d7de; }\n"
+                + "th { background-color: #f6f8fa; color: #24292f; font-weight: bold; border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; }\n"
+                + "td { border: 1px solid #d0d7de; padding: 6px 10px; }\n"
+                + "code, pre { font-family: Consolas, 'Courier New', monospace; font-size: 12px; background-color: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; padding: 2px 4px; }\n"
+                + ".header { background-color: #0066cc; color: #ffffff; padding: 16px 20px; border-radius: 8px; margin-bottom: 16px; }\n"
+                + ".header h1 { color: #ffffff; border-bottom: none; }\n"
+                + ".header p { color: #e6f4ea; }\n"
+                + ".card { background-color: #ffffff; border: 1px solid #d0d7de; border-radius: 8px; padding: 16px; margin-bottom: 14px; }\n"
+                + ".card h2 { color: #00529b; border-bottom: 1px solid #e1e4e8; }\n"
+                + ".inner-box { background-color: #f6f8fa; border-left: 4px solid #0066cc; padding: 10px 14px; margin: 10px 0; }\n"
+                + "span { color: #d73a49; font-weight: bold; }\n"
+                + "</style>\n";
+
+        if (clean.toLowerCase().contains("<head>")) {
+            clean = clean.replaceFirst("(?i)<head>", "<head>" + Matcher.quoteReplacement(injectedCss));
+        } else if (clean.toLowerCase().contains("<html>")) {
+            clean = clean.replaceFirst("(?i)<html>", "<html><head>" + Matcher.quoteReplacement(injectedCss) + "</head>");
+        } else {
+            clean = "<html><head>" + injectedCss + "</head><body>" + clean + "</body></html>";
+        }
+
         return clean;
+    }
+
+    private String resolveRelativeUrls(String html, String baseUrl) {
+        if (baseUrl == null || baseUrl.isEmpty() || !baseUrl.startsWith("http")) return html;
+        try {
+            URI baseUri = URI.create(baseUrl);
+            Pattern p = Pattern.compile("(?i)(href|src)=[\"']([^\"'#]+)[\"']");
+            Matcher m = p.matcher(html);
+            StringBuilder sb = new StringBuilder();
+            while (m.find()) {
+                String attr = m.group(1);
+                String path = m.group(2).trim();
+                if (!path.startsWith("http://") && !path.startsWith("https://")
+                        && !path.startsWith("data:") && !path.startsWith("javascript:")
+                        && !path.startsWith("mailto:")) {
+                    try {
+                        URI resolved = baseUri.resolve(path);
+                        m.appendReplacement(sb, attr + "=\"" + resolved.toASCIIString() + "\"");
+                        continue;
+                    } catch (Exception ignored) {}
+                }
+                m.appendReplacement(sb, Matcher.quoteReplacement(m.group(0)));
+            }
+            m.appendTail(sb);
+            return sb.toString();
+        } catch (Exception e) {
+            return html;
+        }
+    }
+
+    private String inlineStylesheets(String html, String baseUrl) {
+        if (baseUrl == null || baseUrl.isEmpty()) return html;
+        try {
+            URI baseUri = URI.create(baseUrl);
+            Pattern p = Pattern.compile("(?i)<link[^>]+rel=[\"']stylesheet[\"'][^>]*href=[\"']([^\"']+)[\"'][^>]*>");
+            Matcher m = p.matcher(html);
+            StringBuilder sb = new StringBuilder();
+            while (m.find()) {
+                String cssHref = m.group(1).trim();
+                String cssContent = "";
+                try {
+                    URI cssUri = baseUri.resolve(cssHref);
+                    if ("file".equalsIgnoreCase(cssUri.getScheme())) {
+                        cssContent = Files.readString(Path.of(cssUri), StandardCharsets.UTF_8);
+                    } else if (cssUri.getScheme() != null && cssUri.getScheme().startsWith("http")) {
+                        HttpRequest req = HttpRequest.newBuilder(cssUri)
+                                .timeout(Duration.ofSeconds(3))
+                                .header("User-Agent", "Mozilla/5.0 VKU-SimpleBrowser/4.0")
+                                .build();
+                        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                        if (resp.statusCode() == 200) {
+                            cssContent = resp.body();
+                        }
+                    }
+                } catch (Exception ignored) {}
+
+                if (!cssContent.isEmpty()) {
+                    String filteredCss = cssContent.replaceAll("(?is)@media[^{]+\\{([^{}]*\\{[^{}]*\\})*\\s*\\}", "")
+                            .replaceAll("(?is)@keyframes[^{]+\\{([^{}]*\\{[^{}]*\\})*\\s*\\}", "");
+                    m.appendReplacement(sb, "<style type='text/css'>" + Matcher.quoteReplacement(filteredCss) + "</style>");
+                } else {
+                    m.appendReplacement(sb, "");
+                }
+            }
+            m.appendTail(sb);
+            return sb.toString();
+        } catch (Exception e) {
+            return html;
+        }
     }
 
     private int countHtmlTag(String html, String tagName) {
@@ -456,14 +692,6 @@ public class SimpleBrowser extends JFrame {
         updateNavButtons();
     }
 
-    private static final String PG_URL = "jdbc:postgresql://127.0.0.1:5432/lab8_server1";
-    private static final String PG_USER = "lab8_server1";
-    private static final String PG_PASS = "Lab8_e03980b458a7046436b168e426cee1aa5f2db97cf615811f";
-
-    private static final String MYSQL_URL = "jdbc:mysql://localhost:3306/vku_network_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
-    private static final String MYSQL_USER = "root";
-    private static final String MYSQL_PASS = "";
-
     private void saveHistoryEntryToDb(HistoryEntry e) {
         boolean exists = new File(HISTORY_DB_FILE).exists();
         try (PrintWriter pw = new PrintWriter(new OutputStreamWriter(new FileOutputStream(HISTORY_DB_FILE, true), StandardCharsets.UTF_8))) {
@@ -474,93 +702,9 @@ public class SimpleBrowser extends JFrame {
                     escapeCsv(e.time), escapeCsv(e.method), escapeCsv(e.url), escapeCsv(e.postData), e.statusCode, e.contentLength);
         } catch (IOException ignored) {}
 
-        // Ghi đồng thời vào PostgreSQL và MySQL (chạy bất đồng bộ trong background thread)
-        new Thread(() -> {
-            // 1. Ghi vào PostgreSQL (lab8_server1.browser_history)
-            try {
-                Class.forName("org.postgresql.Driver");
-                try (Connection conn = DriverManager.getConnection(PG_URL, PG_USER, PG_PASS);
-                     PreparedStatement ps = conn.prepareStatement(
-                             "INSERT INTO browser_history (time, method, url, post_data, status_code, content_length) VALUES (?, ?, ?, ?, ?, ?)")) {
-                    ps.setString(1, e.time);
-                    ps.setString(2, e.method);
-                    ps.setString(3, e.url);
-                    ps.setString(4, e.postData);
-                    ps.setInt(5, e.statusCode);
-                    ps.setLong(6, e.contentLength);
-                    ps.executeUpdate();
-                }
-            } catch (Throwable ignored) {}
-
-            // 2. Ghi vào MySQL XAMPP (vku_network_db.browser_history)
-            try {
-                Class.forName("com.mysql.cj.jdbc.Driver");
-                try (Connection conn = DriverManager.getConnection(MYSQL_URL, MYSQL_USER, MYSQL_PASS);
-                     PreparedStatement ps = conn.prepareStatement(
-                             "INSERT INTO browser_history (time, method, url, post_data, status_code, content_length) VALUES (?, ?, ?, ?, ?, ?)")) {
-                    ps.setString(1, e.time);
-                    ps.setString(2, e.method);
-                    ps.setString(3, e.url);
-                    ps.setString(4, e.postData);
-                    ps.setInt(5, e.statusCode);
-                    ps.setLong(6, e.contentLength);
-                    ps.executeUpdate();
-                }
-            } catch (Throwable ignored) {}
-        }).start();
     }
 
     private void loadHistoryDatabase() {
-        // Ưu tiên 1: Nạp từ PostgreSQL
-        boolean loaded = false;
-        try {
-            Class.forName("org.postgresql.Driver");
-            try (Connection conn = DriverManager.getConnection(PG_URL, PG_USER, PG_PASS);
-                 Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery("SELECT time, method, url, post_data, status_code, content_length FROM browser_history ORDER BY id ASC")) {
-
-                while (rs.next()) {
-                    HistoryEntry e = new HistoryEntry(
-                            rs.getString("time"),
-                            rs.getString("method"),
-                            rs.getString("url"),
-                            rs.getString("post_data"),
-                            rs.getInt("status_code"),
-                            rs.getLong("content_length")
-                    );
-                    visitLog.add(e);
-                    loaded = true;
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        if (loaded && !visitLog.isEmpty()) return;
-
-        // Ưu tiên 2: Nạp từ XAMPP MySQL
-        try {
-            Class.forName("com.mysql.cj.jdbc.Driver");
-            try (Connection conn = DriverManager.getConnection(MYSQL_URL, MYSQL_USER, MYSQL_PASS);
-                 Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery("SELECT time, method, url, post_data, status_code, content_length FROM browser_history ORDER BY id ASC")) {
-
-                while (rs.next()) {
-                    HistoryEntry e = new HistoryEntry(
-                            rs.getString("time"),
-                            rs.getString("method"),
-                            rs.getString("url"),
-                            rs.getString("post_data"),
-                            rs.getInt("status_code"),
-                            rs.getLong("content_length")
-                    );
-                    visitLog.add(e);
-                    loaded = true;
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        if (loaded && !visitLog.isEmpty()) return;
-
-        // Ưu tiên 3: Fallback nạp từ file CSV
         File f = new File(HISTORY_DB_FILE);
         if (!f.exists()) return;
         try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
@@ -583,7 +727,7 @@ public class SimpleBrowser extends JFrame {
     }
 
     private void showDatabaseDialog() {
-        JDialog dlg = new JDialog(this, "🗄️ Quản lý Cơ sở Dữ liệu Lịch sử Duyệt Web (" + visitLog.size() + " bản ghi)", true);
+        JDialog dlg = new JDialog(this, "Lịch sử Browser trên máy này (" + visitLog.size() + " bản ghi)", true);
         dlg.setSize(850, 480);
         dlg.setLocationRelativeTo(this);
         dlg.setLayout(new BorderLayout(6, 6));
@@ -610,20 +754,14 @@ public class SimpleBrowser extends JFrame {
             }
         });
 
-        JButton btnClearDb = new JButton("Xóa toàn bộ CSDL");
+        JButton btnClearDb = new JButton("Xóa lịch sử trên máy này");
         btnClearDb.addActionListener(ev -> {
-            int confirm = JOptionPane.showConfirmDialog(dlg, "Bạn có chắc chắn muốn xóa toàn bộ CSDL lịch sử?", "Xác nhận", JOptionPane.YES_NO_OPTION);
+            int confirm = JOptionPane.showConfirmDialog(dlg, "Bạn có chắc chắn muốn xóa lịch sử trên máy này? Nhật ký PostgreSQL trên Server vẫn được giữ.", "Xác nhận", JOptionPane.YES_NO_OPTION);
             if (confirm == JOptionPane.YES_OPTION) {
                 visitLog.clear();
                 navStack.clear();
                 navIndex = -1;
                 new File(HISTORY_DB_FILE).delete();
-                new Thread(() -> {
-                    try (Connection conn = DriverManager.getConnection(MYSQL_URL, MYSQL_USER, MYSQL_PASS);
-                         Statement stmt = conn.createStatement()) {
-                        stmt.executeUpdate("DELETE FROM browser_history");
-                    } catch (Throwable ignored) {}
-                }).start();
                 model.setRowCount(0);
                 updateNavButtons();
             }
@@ -656,7 +794,9 @@ public class SimpleBrowser extends JFrame {
 
     private void openInSystemBrowser() {
         try {
-            Desktop.getDesktop().browse(URI.create(lastUrl));
+            URI uri = URI.create(lastUrl);
+            if ("file".equalsIgnoreCase(uri.getScheme())) Desktop.getDesktop().open(Path.of(uri).toFile());
+            else Desktop.getDesktop().browse(uri);
         } catch (Exception ex) {
             JOptionPane.showMessageDialog(this, "Không thể mở trình duyệt ngoài: " + ex.getMessage());
         }
@@ -665,10 +805,69 @@ public class SimpleBrowser extends JFrame {
     private void autoScanLanServer(boolean silent) {
         new Thread(() -> {
             String myIp = getLocalIPv4();
-            if (myIp != null && !myIp.equals("127.0.0.1")) {
-                SwingUtilities.invokeLater(() -> txtUrl.setText("http://localhost:" + SERVER_PORT + "/index.html"));
+            if (!silent) {
+                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                        "Đang quét tìm HTTP Server cổng " + SERVER_PORT + " trong mạng LAN (" + myIp.substring(0, Math.max(0, myIp.lastIndexOf('.') + 1)) + "*)...",
+                        "Quét LAN", JOptionPane.INFORMATION_MESSAGE));
             }
+            List<String> found = Collections.synchronizedList(new ArrayList<>());
+            // Check localhost first
+            if (checkHttpPort("127.0.0.1", SERVER_PORT)) {
+                found.add("localhost");
+            }
+            if (!myIp.equals("127.0.0.1") && checkHttpPort(myIp, SERVER_PORT)) {
+                if (!found.contains("localhost")) found.add(myIp);
+            }
+
+            // If on a LAN, scan the /24 subnet
+            if (myIp.contains(".") && !myIp.startsWith("127.")) {
+                String prefix = myIp.substring(0, myIp.lastIndexOf('.') + 1);
+                ExecutorService pool = Executors.newFixedThreadPool(40);
+                for (int i = 1; i <= 254; i++) {
+                    final String targetIp = prefix + i;
+                    if (targetIp.equals(myIp)) continue;
+                    pool.execute(() -> {
+                        if (checkHttpPort(targetIp, SERVER_PORT)) {
+                            found.add(targetIp);
+                        }
+                    });
+                }
+                pool.shutdown();
+                try {
+                    pool.awaitTermination(2500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (InterruptedException ignored) {}
+            }
+
+            SwingUtilities.invokeLater(() -> {
+                if (!found.isEmpty()) {
+                    // Ưu tiên chọn máy đối tác trong LAN (khác localhost và khác myIp) nếu có
+                    String chosen = found.stream()
+                            .filter(ip -> !ip.equals("localhost") && !ip.equals("127.0.0.1") && !ip.equals(myIp))
+                            .findFirst()
+                            .orElse(found.get(0));
+                    txtUrl.setText("http://" + chosen + ":" + SERVER_PORT + "/index.html");
+                    if (!silent) {
+                        JOptionPane.showMessageDialog(this,
+                                "Đã tìm thấy Web Server đang hoạt động:\n" + String.join("\n", found) +
+                                "\n\nĐã tự động điền: http://" + chosen + ":" + SERVER_PORT + "/index.html vào thanh URL!",
+                                "Tìm thấy Server LAN", JOptionPane.INFORMATION_MESSAGE);
+                    }
+                } else if (!silent) {
+                    JOptionPane.showMessageDialog(this,
+                            "Không tìm thấy HTTP Server nào trên cổng " + SERVER_PORT + " trong mạng LAN.\nHãy chắc chắn máy kia đã bật httpServer và mở tường lửa!",
+                            "Kết quả quét LAN", JOptionPane.WARNING_MESSAGE);
+                }
+            });
         }).start();
+    }
+
+    private static boolean checkHttpPort(String ip, int port) {
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress(ip, port), 250);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static String getLocalIPv4() {
