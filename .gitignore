@@ -1,0 +1,11 @@
+*.class
+*.log
+*.csv
+target/
+build/
+.tools/
+mail_data/
+chat_files/
+ftp_root/
+.vscode/
+.idea/
